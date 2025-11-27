@@ -1,0 +1,1194 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Create the Lambda, Database to store the EOL data, and the APIGW/Lambda to query it
+
+Conditions:
+  HasCustomCertificate: !Not [!Equals [!Ref AcmCertificateArn, '']]
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket containing EOL data
+  ApiGwStageName:
+    Type: String 
+    Default: dev
+  EOLApiGwPathPart:
+    Type: String
+    Default: eol
+  Region:
+    Type: String
+    Description: AWS region
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 3 1 * ? *)"
+    Description: EventBridge schedule expression for running EOL data processing (default 1st of every month at 3AM UTC)
+
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: (Optional) ACM Certificate ARN for custom SSL certificate. If not provided, CloudFront default certificate will be used
+
+Resources:
+
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CloudWatch log group encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Allow LogGroups to use the KMS key
+            Effect: Allow
+            Principal:
+              Service: 
+                - logs.amazonaws.com
+                - states.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt
+              - kms:ReEncryptFrom
+              - kms:ReEncryptTo
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: "*"
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+
+  EOLTrackerDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: service
+          AttributeType: S
+        - AttributeName: cycle
+          AttributeType: S
+      KeySchema:
+        - AttributeName: service
+          KeyType: HASH
+        - AttributeName: cycle
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: auto-delete
+          Value: no
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+  AWSLambdaDynamoDBBedrockCustomPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:DescribeTable
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Scan
+              - dynamodb:Query
+              - bedrock:InvokeAgent
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+              - bedrock:RetrieveAndGenerate
+              - ssm:PutParameter
+              - ssm:GetParameter
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+              - lambda:InvokeFunction
+            Resource:
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+              - !Sub 'arn:aws:bedrock:us-east-2::foundation-model/*'
+              - !Sub 'arn:aws:bedrock:us-west-2::foundation-model/*'
+              - !Sub 'arn:aws:bedrock:${Region}:${AWS::AccountId}:inference-profile/*'
+              - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*EOLTrackerDB*'
+              - !Sub 'arn:aws:s3:::${S3BucketName}'
+              - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+    DeletionPolicy: Delete
+
+  # Step Functions Role for orchestrating Lambda execution  
+  StepFunctionsLambdaInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:EOLMcpAgentFunction'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:EOLDataImportFunction'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:LoadConfigFunction'
+    DeletionPolicy: Delete
+
+  StepFunctionsLoggingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogDelivery
+              - logs:GetLogDelivery
+              - logs:UpdateLogDelivery
+              - logs:DeleteLogDelivery
+              - logs:ListLogDeliveries
+              - logs:PutResourcePolicy
+              - logs:DescribeResourcePolicies
+              - logs:DescribeLogGroups
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !GetAtt StepFunctionsLogGroup.Arn
+              - !Sub '${StepFunctionsLogGroup.Arn}:*'
+    DeletionPolicy: Delete
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref StepFunctionsLambdaInvokePolicy
+        - !Ref StepFunctionsLoggingPolicy
+    DeletionPolicy: Delete
+
+  EventBridgeSchedulerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource:
+              - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:EOLDataProcessingStateMachine'
+    DeletionPolicy: Delete
+
+  # EventBridge Scheduler Role
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref EventBridgeSchedulerPolicy
+    DeletionPolicy: Delete
+
+  # Dead Letter Queues for Lambda functions
+  CustomAuthorizerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: CustomAuthorizerFunction-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  EOLDataImportDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: EOLDataImportFunction-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  EOLDataQueryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: EOLDataQueryFunction-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  EOLMcpAgentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: EOLMcpAgentFunction-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+    DeletionPolicy: Delete
+
+  VPCFlowLogPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs-${AWS::StackName}:*'
+          - Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+    DeletionPolicy: Delete
+
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref VPCFlowLogPolicy
+    DeletionPolicy: Delete
+
+  VPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs-${AWS::StackName}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+    DeletionPolicy: Delete
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+    DeletionPolicy: Delete
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+    DeletionPolicy: Delete
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+    DeletionPolicy: Delete
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DeletionPolicy: Delete
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+    DeletionPolicy: Delete
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+    DependsOn: AttachGateway
+    DeletionPolicy: Delete
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+    DependsOn: AttachGateway
+    DeletionPolicy: Delete
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+    DeletionPolicy: Delete
+
+  PublicRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/1
+      GatewayId: !Ref InternetGateway
+    DependsOn: AttachGateway
+    DeletionPolicy: Delete
+
+  PublicRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 128.0.0.0/1
+      GatewayId: !Ref InternetGateway
+    DependsOn: AttachGateway
+    DeletionPolicy: Delete
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+    DeletionPolicy: Delete
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTable
+    DeletionPolicy: Delete
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+    DeletionPolicy: Delete
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+    DeletionPolicy: Delete
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+    DeletionPolicy: Delete
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+          Description: Allow HTTPS within VPC for interface endpoints
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS to internet via NAT Gateway for AWS documentation
+    DeletionPolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: Lambda needs internet access via NAT Gateway to fetch AWS documentation. VPC endpoints handle S3/DynamoDB/Bedrock/SQS traffic.
+
+  LambdaSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Allow HTTPS from Lambda to VPC endpoints
+    DeletionPolicy: Delete
+
+
+
+
+
+  DynamoDBVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+    DeletionPolicy: Delete
+
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+    DeletionPolicy: Delete
+
+  BedrockVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-runtime'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  SQSVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  StepFunctionsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.states'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  LambdaDLQPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource:
+              - !GetAtt CustomAuthorizerDLQ.Arn
+              - !GetAtt EOLDataImportDLQ.Arn
+              - !GetAtt EOLDataQueryDLQ.Arn
+              - !GetAtt EOLMcpAgentDLQ.Arn
+              - !GetAtt LoadConfigDLQ.Arn
+    DeletionPolicy: Delete
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Ref AWSLambdaDynamoDBBedrockCustomPolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+        - !Ref LambdaDLQPolicy
+    DeletionPolicy: Delete
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: EOLTrackerApiGateway
+      Description: EOL Tracker API Gateway
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+    DeletionPolicy: Delete
+
+  # EOL Data API resources
+  ApiGatewayResourceEOL:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: !Ref EOLApiGwPathPart
+      RestApiId: !Ref ApiGateway
+    DeletionPolicy: Delete
+
+  ApiGatewayMethodEOL:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayResourceEOL
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CustomAuthorizer
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EOLDataQueryFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Content-Type: true
+    DeletionPolicy: Delete
+
+  # CORS Support for EOL API
+  ApiGatewayMethodEOLOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref ApiGatewayResourceEOL
+      RestApiId: !Ref ApiGateway
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+    DeletionPolicy: Delete
+
+  CustomAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CustomAuthorizerFunction
+      Runtime: python3.12
+      Timeout: 900
+      ReservedConcurrentExecutions: 10
+      CodeUri: ./src/CustomAuthorizerFunction.py
+      Handler: CustomAuthorizerFunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt CustomAuthorizerDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  CustomAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CustomAuthorizer
+      RestApiId: !Ref ApiGateway
+      Type: REQUEST
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomAuthorizerFunction.Arn}/invocations
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: method.request.header.Authorization
+      IdentityValidationExpression: '.*'
+      AuthorizerCredentials: !GetAtt ApiGatewayRole.Arn
+
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref ApiGwCustomPolicy
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+    DeletionPolicy: Delete
+
+  ApiGwCustomPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - execute-api:Invoke
+              - lambda:InvokeFunction
+            Resource: 
+              - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CustomAuthorizerFunction}'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${EOLDataQueryFunction}'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${EOLMcpAgentFunction}'
+              - !GetAtt KMSKey.Arn
+    DeletionPolicy: Delete
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethodEOL
+      - ApiGatewayMethodEOLOptions
+      - ApiGatewayRole
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref ApiGwStageName
+      StageDescription:
+        AccessLogSetting:
+          DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","validationError":"$context.error.validationErrorString","userAgent":"$context.identity.userAgent","stage":"$context.stage","responseTime":"$context.responseTime"}'
+        TracingEnabled: true
+        CacheClusterEnabled: true
+        CacheClusterSize: '0.5'
+        LoggingLevel: INFO
+        DataTraceEnabled: true
+        MetricsEnabled: true
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+    DeletionPolicy: Delete
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Description: API Key for EOL Tracker API
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref ApiGateway
+          StageName: !Ref ApiGwStageName
+    DependsOn: ApiGatewayDeployment
+    DeletionPolicy: Delete
+
+  ApiGatewayUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: EOLTrackerUsagePlan
+      Description: Usage plan for EOL Tracker API
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: !Ref ApiGwStageName
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: 10000
+        Period: DAY
+    DependsOn: ApiGatewayDeployment
+    DeletionPolicy: Delete
+
+  ApiGatewayUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiGatewayUsagePlan
+    DeletionPolicy: Delete
+
+  ApiGwAccount:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayRole.Arn
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub 'API-Gateway-Access-Logs-${ApiGateway}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+
+
+  EOLDataImportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: EOLDataImportFunction
+      Runtime: python3.12
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+      CodeUri: ./src/EOLDataImportFunction.py
+      Handler: EOLDataImportFunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt EOLDataImportDLQ.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EOLTrackerDB
+          S3_BUCKET_NAME: !Ref S3BucketName
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  EOLDataQueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: EOLDataQueryFunction
+      Runtime: python3.12
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+      CodeUri: ./src/EOLDataQueryFunction.py
+      Handler: EOLDataQueryFunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt EOLDataQueryDLQ.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EOLTrackerDB
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  EOLMCPLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: EOLMCPLayer
+      Description: Lambda layer containing MCP and agent dependencies
+      Content:
+        S3Bucket: !Ref S3BucketName
+        S3Key: layers/eol_mcp_layer.zip
+      CompatibleRuntimes:
+        - python3.12
+    DeletionPolicy: Delete
+
+  LoadConfigDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: LoadConfigFunction-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  LoadConfigFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: LoadConfigFunction
+      Runtime: python3.12
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      CodeUri: ./src/
+      Handler: LoadConfigFunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LoadConfigDLQ.Arn
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  EOLMcpAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: EOLMcpAgentFunction
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 2048
+      ReservedConcurrentExecutions: 1
+      CodeUri: ./src/
+      Handler: EOLMcpAgent.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt EOLMcpAgentDLQ.Arn
+      Layers:
+        - !Ref EOLMCPLayer
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EOLTrackerDB
+          S3_BUCKET_NAME: !Ref S3BucketName
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      EphemeralStorage:
+        Size: 2048
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/EOLDataProcessingStateMachine
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KMSKey.Arn
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  # Step Functions State Machine with Map state for parallel processing
+  EOLDataProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: EOLDataProcessingStateMachine
+      DefinitionString: !Sub |
+        {
+          "Comment": "Process EOL data for multiple AWS services from config file",
+          "StartAt": "LoadServiceConfig",
+          "States": {
+            "LoadServiceConfig": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${LoadConfigFunction}",
+                "Payload": {
+                  "configPath": "cfg/aws_services.json"
+                }
+              },
+              "ResultPath": "$.configResult",
+              "ResultSelector": {
+                "services.$": "$.Payload.services"
+              },
+              "Next": "ProcessEachService"
+            },
+            "ProcessEachService": {
+              "Type": "Map",
+              "ItemsPath": "$.configResult.services",
+              "MaxConcurrency": 1,
+              "Iterator": {
+                "StartAt": "RunEOLMcpAgent",
+                "States": {
+                  "RunEOLMcpAgent": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${EOLMcpAgentFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultPath": "$.mcpResult",
+                    "Next": "RunEOLDataImport",
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                        "IntervalSeconds": 2,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2
+                      },
+                      {
+                        "ErrorEquals": ["States.TaskFailed"],
+                        "IntervalSeconds": 90,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2
+                      },
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "IntervalSeconds": 10,
+                        "MaxAttempts": 2,
+                        "BackoffRate": 2
+                      }
+                    ],
+                    "Catch": [
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "Next": "HandleMcpAgentFailure",
+                        "ResultPath": "$.error"
+                      }
+                    ]
+                  },
+                  "RunEOLDataImport": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${EOLDataImportFunction}",
+                      "Payload.$": "States.StringToJson($.mcpResult.Payload.body)"
+                    },
+                    "End": true
+                  },
+                  "HandleMcpAgentFailure": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "service.$": "$.service_name",
+                      "error": "MCP Agent failed after all retry attempts",
+                      "errorDetails.$": "$.error",
+                      "timestamp.$": "$$.State.EnteredTime"
+                    },
+                    "End": true
+                  }
+                }
+              },
+              "Next": "ProcessingComplete"
+            },
+            "ProcessingComplete": {
+              "Type": "Succeed",
+              "Comment": "EOL data processing completed successfully"
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+    DeletionPolicy: Delete
+
+  # EventBridge Scheduler for triggering EOL data processing
+  EOLDataProcessingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: EOLDataProcessingSchedule
+      Description: Schedule to trigger EOL data processing workflow monthly
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EOLDataProcessingStateMachine.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: |
+          {
+            "scheduledExecution": true,
+            "triggerTime": "$SCHEDULED_TIME"
+          }
+    DeletionPolicy: Delete
+
+  LambdaPermissionApiGWQuery:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EOLDataQueryFunction
+      Principal: apigateway.amazonaws.com
+      Action: lambda:InvokeFunction
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+    DeletionPolicy: Delete
+
+
+
+  CloudFrontAccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketName}-cloudfront-access-logs'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Sub '${S3BucketName}-cloudfront-access-logs'
+        LogFilePrefix: access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      VersioningConfiguration:
+        Status: Enabled
+    DeletionPolicy: Delete
+
+  CloudFrontAccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudFrontAccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontAccessLogsDelivery
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetBucketAcl
+              - s3:PutBucketAcl
+            Resource:
+              - !Sub 'arn:aws:s3:::${CloudFrontAccessLogsBucket}/*'
+              - !Sub 'arn:aws:s3:::${CloudFrontAccessLogsBucket}'
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${CloudFrontAccessLogsBucket}/*'
+              - !Sub 'arn:aws:s3:::${CloudFrontAccessLogsBucket}'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+    DeletionPolicy: Delete
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          ForwardedValues:
+            Headers:
+              - Access-Control-Request-Headers
+              - Access-Control-Request-Method
+              - Origin
+              - Authorization
+            QueryString: false
+            QueryStringCacheKeys: []
+          TargetOriginId: ApiGatewayOrigin
+          ViewerProtocolPolicy: redirect-to-https
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        Logging:
+          Bucket: !GetAtt CloudFrontAccessLogsBucket.DomainName
+          IncludeCookies: false
+          Prefix: cloudfront-access-logs/
+        Origins:
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub "${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+        PriceClass: PriceClass_100
+        ViewerCertificate: !If
+          - HasCustomCertificate
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            MinimumProtocolVersion: TLSv1.2_2021
+            SslSupportMethod: sni-only
+          - CloudFrontDefaultCertificate: true
+        WebACLId: !GetAtt CloudFrontWAFWebACL.Arn
+    DeletionPolicy: Delete
+    
+
+  CloudFrontWAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      DefaultAction:
+        Allow: {}
+      Scope: CLOUDFRONT
+      Rules:
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 0
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+            SampledRequestsEnabled: true
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: CloudFrontWAFWebACL
+        SampledRequestsEnabled: true
+    DeletionPolicy: Delete
+
+
+Outputs:
+
+  ApiUrl:
+    Description: URL of the CloudFront distribution
+    Value: !Sub https://${CloudFrontDistribution.DomainName}/${ApiGwStageName}/${EOLApiGwPathPart}
+  
+  EOLApiUrl:
+    Description: Direct API Gateway URL for querying EOL service data
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiGwStageName}/${EOLApiGwPathPart}

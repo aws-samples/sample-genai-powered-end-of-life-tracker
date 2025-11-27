@@ -1,0 +1,4 @@
+cfn-templates/samconfig.toml
+cfn-templates/build-layer/lambda_layer/
+cfn-templates/build-layer/*.zip
+.amazonq
