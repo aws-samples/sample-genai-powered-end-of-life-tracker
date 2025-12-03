@@ -7,7 +7,7 @@ The EOL Tracker is an AWS-based solution that automatically extracts and tracks 
 **NEW: Multi-Model Support** - The system now supports running EOL extraction with multiple AI models simultaneously, allowing you to compare results across different models and improve accuracy through consensus.
 
 The solution leverages:
-- **Amazon Bedrock** with multiple AI models (Anthropic Claude, Amazon Nova, Meta Llama, OpenAI, Qwen) for intelligent document analysis
+- **Amazon Bedrock** with multiple AI models (Anthropic Claude, Amazon Nova...) for intelligent document analysis
 - **Model Context Protocol (MCP)** for AWS documentation access
 - **AWS Step Functions** for orchestrating multi-model data extraction workflows
 - **DynamoDB** with composite keys for storing model-specific EOL data
@@ -97,16 +97,6 @@ Reflects model capability level:
 - **Standard Models (0.2):** Other models
 - **Example:** Claude Sonnet 4 → 1.0
 
-### Score Interpretation
-
-| Score Range | Interpretation | Recommendation |
-|-------------|----------------|----------------|
-| 0.90 - 1.00 | Highly reliable | Use with confidence |
-| 0.75 - 0.89 | Reliable | Generally trustworthy |
-| 0.60 - 0.74 | Moderate reliability | Verify critical fields |
-| 0.40 - 0.59 | Low reliability | Manual verification recommended |
-| 0.00 - 0.39 | Very low reliability | Do not use without verification |
-
 ### Example Score Calculation
 
 **Scenario:** Amazon EKS 1.30 extracted by Claude Sonnet 4
@@ -164,8 +154,6 @@ Three models extract Amazon RDS MySQL 8.0:
 
 **Result:** All models are evaluated fairly with the same peer comparison data, ensuring the "best record" selection is truly accurate.
 
-See [RETROACTIVE_RECALCULATION.md](RETROACTIVE_RECALCULATION.md) for technical details.
-
 ### Improving Accuracy Scores
 
 To get higher accuracy scores:
@@ -192,8 +180,6 @@ aws dynamodb scan --table-name EOLTrackerDB --region us-east-1 \
     })'
 ```
 
-For detailed information about the scoring algorithm, implementation, and query patterns, see the [DynamoDB Schema Documentation](cfn-templates/DYNAMODB_SCHEMA.md).
-
 ## Architecture Components
 
 - **Lambda Functions**:
@@ -210,7 +196,7 @@ For detailed information about the scoring algorithm, implementation, and query 
   - Security groups with restricted egress rules
   - VPC Flow Logs for network monitoring
 - **Step Functions State Machine**: Orchestrates multi-model sequential execution with nested Map states
-- **DynamoDB Table**: Stores EOL information with composite keys (service + cycle_model) and accuracy scores for multi-model support (see [DynamoDB Schema Documentation](cfn-templates/DYNAMODB_SCHEMA.md))
+- **DynamoDB Table**: Stores EOL information with composite keys (service + cycle_model) and accuracy scores for multi-model support 
 - **API Gateway**: REST API with custom authorization and X-Ray tracing
 - **CloudFront Distribution**: CDN with WAF protection (includes Log4Shell protection)
 - **EventBridge Scheduler**: Triggers monthly data updates
@@ -241,12 +227,6 @@ For detailed information about the scoring algorithm, implementation, and query 
 
 - S3 bucket for storing Lambda layers and EOL data
 - Region: **us-east-1** (required for cross-region inference and latest model availability)
-
-### Enable Bedrock Models
-
-Navigate to the Bedrock console → Model access and request access to the models you want to use. The system supports both standard model identifiers and cross-region inference profiles:
-- Standard format: `anthropic.claude-3-7-sonnet-20250219-v1:0`
-- Cross-region format: `us.anthropic.claude-sonnet-4-20250514-v1:0`
 
 ## Deployment Instructions
 
@@ -410,7 +390,7 @@ By default, the API returns only the highest accuracy score record for each serv
 | 0.40 - 0.59 | Low reliability | Manual verification recommended |
 | 0.00 - 0.39 | Very low reliability | Do not use without verification |
 
-**Note:** Each record includes an `accuracy_score` field (0.0-1.0) indicating reliability based on consensus with other models, data completeness, date validity, and model tier. See [DynamoDB Schema Documentation](cfn-templates/DYNAMODB_SCHEMA.md) for detailed scoring methodology.
+**Note:** Each record includes an `accuracy_score` field (0.0-1.0) indicating reliability based on consensus with other models, data completeness, date validity, and model tier. 
 
 ### Advanced Query Examples
 
@@ -563,215 +543,6 @@ Parameters:
     Type: String
     Default: "cron(0 3 1 * ? *)"  # 1st of month at 3 AM UTC
 ```
-
-## Migration from Previous Version
-
-If you're upgrading from a version without multi-model support, follow these steps:
-
-### Prerequisites
-
-- Backup of existing DynamoDB data
-- Python 3.12+ installed
-- boto3 library: `pip install boto3`
-- AWS CLI configured with appropriate credentials
-
-### Migration Process
-
-#### Step 1: Create Backup
-
-```bash
-# Automatic backup via migration script (recommended)
-cd cfn-templates
-python migrate_dynamodb_schema.py \
-  --table-name EOLTrackerDB \
-  --default-model "us.anthropic.claude-sonnet-4-20250514-v1:0" \
-  --region us-east-1 \
-  --dry-run
-
-# Manual backup (optional additional safety)
-aws dynamodb create-backup \
-  --table-name EOLTrackerDB \
-  --backup-name EOLTrackerDB-pre-migration-$(date +%Y%m%d) \
-  --region us-east-1
-```
-
-#### Step 2: Run Migration Script
-
-The migration script transforms existing records to the new schema:
-
-```bash
-python migrate_dynamodb_schema.py \
-  --table-name EOLTrackerDB \
-  --default-model "us.anthropic.claude-sonnet-4-20250514-v1:0" \
-  --region us-east-1
-```
-
-**What the script does:**
-1. Creates automatic backup
-2. Scans all existing records
-3. Adds `model_name` attribute (using default model)
-4. Creates `cycle_model` composite key: `{cycle}#{model_name}`
-5. Adds `accuracy_score` attribute (calculated based on completeness and date validity)
-6. Writes updated records back to table
-7. Validates migration success
-
-#### Step 3: Update Configuration File
-
-Migrate your configuration file from the old format:
-
-```bash
-cd cfn-templates/src/cfg
-# Rename the file
-mv aws_services.json EOLTracker_config.json
-
-# Edit the file to add models array
-# Change from: [{"service_name": ...}]
-# To: {"models": [...], "services": [{"service_name": ...}]}
-```
-
-#### Step 4: Update CloudFormation Stack
-
-Deploy the updated template:
-
-```bash
-cd cfn-templates
-sam deploy \
-  --stack-name EOLTracker \
-  --region us-east-1 \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides S3BucketName=<your-bucket> Region=us-east-1 \
-  --template ./EOLTrackerTemplate.yml
-```
-
-#### Step 5: Verify Migration
-
-Test the updated system:
-
-```bash
-# Query a service to verify new schema
-awscurl --service execute-api \
-  "https://<api-id>.execute-api.us-east-1.amazonaws.com/dev/eol?service=Amazon%20RDS"
-
-# Verify DynamoDB records have new attributes
-aws dynamodb query \
-  --table-name EOLTrackerDB \
-  --key-condition-expression "service = :service" \
-  --expression-attribute-values '{":service":{"S":"Amazon RDS"}}' \
-  --region us-east-1
-```
-
-**Verify records contain:**
-- `cycle_model` attribute (composite key)
-- `cycle` attribute (extracted value)
-- `model_name` attribute (model identifier)
-- `accuracy_score` attribute (0.0-1.0)
-
-### Migration Troubleshooting
-
-#### Issue: Cycle contains '#' character
-
-**Error:** `ValueError: Cycle cannot contain '#' character`
-
-**Solution:** The '#' character is reserved as the separator in composite keys. Clean your data to remove or replace '#' characters before migration.
-
-#### Issue: Missing required fields
-
-**Error:** `Record missing required fields`
-
-**Solution:** Ensure all records have both `service` and `cycle` attributes before migration.
-
-#### Issue: Validation fails
-
-**Error:** `Record count mismatch` or `Record missing cycle_model`
-
-**Solution:**
-1. Check migration logs for specific errors
-2. Verify all records were processed
-3. Restore from backup if needed
-4. Re-run migration after fixing issues
-
-### Rollback Procedures
-
-If issues occur during or after migration, you have several options:
-
-#### Option 1: Restore from Automatic Backup
-
-The migration script creates an automatic backup before making changes:
-
-```bash
-# List available backups
-aws dynamodb list-backups \
-  --table-name EOLTrackerDB \
-  --region us-east-1
-
-# Restore from backup
-aws dynamodb restore-table-from-backup \
-  --target-table-name EOLTrackerDB-restored \
-  --backup-arn <backup-arn-from-list> \
-  --region us-east-1
-
-# After verification, delete old table and rename restored table
-aws dynamodb delete-table --table-name EOLTrackerDB --region us-east-1
-# Wait for deletion to complete
-aws dynamodb update-table \
-  --table-name EOLTrackerDB-restored \
-  --region us-east-1
-# Note: You'll need to update the table name or recreate with original name
-```
-
-#### Option 2: Revert CloudFormation Stack
-
-If the stack update causes issues:
-
-```bash
-# Revert to previous stack version
-aws cloudformation update-stack \
-  --stack-name EOLTracker \
-  --use-previous-template \
-  --region us-east-1 \
-  --capabilities CAPABILITY_NAMED_IAM
-
-# Or delete and redeploy previous version
-aws cloudformation delete-stack --stack-name EOLTracker --region us-east-1
-# Wait for deletion, then redeploy from previous template version
-```
-
-#### Option 3: Manual Data Restoration
-
-If you have a manual backup or export:
-
-```bash
-# Export current data (if needed)
-aws dynamodb scan --table-name EOLTrackerDB > current-data.json
-
-# Restore from previous export
-# (Requires custom script to batch-write items)
-python restore_from_backup.py --backup-file previous-data.json
-```
-
-### Post-Migration Checklist
-
-After successful migration, verify:
-
-- [ ] Record count matches pre-migration count
-- [ ] All records have `cycle_model`, `cycle`, `model_name`, and `accuracy_score` attributes
-- [ ] API queries return expected results
-- [ ] New model filtering works correctly
-- [ ] Step Functions workflow processes multiple models
-- [ ] CloudWatch Logs show no errors
-- [ ] Accuracy scores are within expected range (0.0-1.0)
-
-### Migration Best Practices
-
-1. **Always test in development first** - Create a test table with sample data
-2. **Create multiple backups** - Both automatic and manual
-3. **Run dry-run first** - Use `--dry-run` flag to preview changes
-4. **Monitor during migration** - Watch CloudWatch Logs for errors
-5. **Verify incrementally** - Check a few records before validating all
-6. **Document custom changes** - Note any modifications to the migration process
-7. **Keep old backups** - Retain backups for at least 30 days post-migration
-
-For detailed migration instructions, see [Migration Guide](cfn-templates/MIGRATION_GUIDE.md).
 
 ## Cost Estimation
 
@@ -1016,12 +787,8 @@ aws dynamodb restore-table-from-backup \
 To reduce costs while keeping data:
 
 ```bash
-# Delete only the expensive resources (NAT Gateway, VPC Endpoints)
-# This requires modifying the CloudFormation template to remove VPC configuration
-# Then update the stack:
-sam deploy --stack-name EOLTracker --template ./EOLTrackerTemplate-NoVPC.yml
 
-# Or delete the entire stack and keep only DynamoDB data
+# Delete the entire stack and keep only DynamoDB data
 aws cloudformation delete-stack --stack-name EOLTracker --region us-east-1
 # DynamoDB table will be deleted, but backups remain for 35 days (if PITR enabled)
 ```
@@ -1229,11 +996,6 @@ aws stepfunctions describe-execution \
 # Review error logs
 aws logs tail /aws/lambda/EOLMcpAgentFunction --follow --region us-east-1
 ```
-
-### Migration Issues
-
-See the [Migration from Previous Version](#migration-from-previous-version) section for detailed migration troubleshooting.
-
 ### Performance Issues
 
 #### Slow Query Response
@@ -1256,7 +1018,7 @@ See the [Migration from Previous Version](#migration-from-previous-version) sect
 **Symptom:** Unexpected AWS bill increases
 
 **Possible Causes:**
-1. Multiple models increase Bedrock API costs 5×
+1. Multiple models increase Bedrock API costs
 2. NAT Gateway and VPC Endpoints charge hourly (~$55/month)
 3. Increased DynamoDB storage and throughput
 
