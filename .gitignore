@@ -1,4 +1,12 @@
 cfn-templates/samconfig.toml
 cfn-templates/build-layer/lambda_layer/
 cfn-templates/build-layer/*.zip
+cfn-templates/.hypothesis/
+cfn-templates/.pytest_cache/
+cfn-templates/*.log
 .amazonq
+.kiro
+.hypothesis
+cfn-templates/src/__pycache__/
+cfn-templates/tests/
+img/architecture_diagram.md

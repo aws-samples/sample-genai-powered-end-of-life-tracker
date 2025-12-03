@@ -71,12 +71,12 @@ Resources:
       AttributeDefinitions:
         - AttributeName: service
           AttributeType: S
-        - AttributeName: cycle
+        - AttributeName: cycle_model
           AttributeType: S
       KeySchema:
         - AttributeName: service
           KeyType: HASH
-        - AttributeName: cycle
+        - AttributeName: cycle_model
           KeyType: RANGE
       BillingMode: PAY_PER_REQUEST
       Tags:
@@ -102,6 +102,7 @@ Resources:
               - dynamodb:DescribeTable
               - dynamodb:GetItem
               - dynamodb:PutItem
+              - dynamodb:UpdateItem
               - dynamodb:Scan
               - dynamodb:Query
               - bedrock:InvokeAgent
@@ -138,6 +139,7 @@ Resources:
               - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:EOLMcpAgentFunction'
               - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:EOLDataImportFunction'
               - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:LoadConfigFunction'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:RecalculateAccuracyScoresFunction'
     DeletionPolicy: Delete
 
   StepFunctionsLoggingPolicy:
@@ -246,6 +248,15 @@ Resources:
     Properties:
       QueueName: EOLMcpAgentFunction-dlq
       MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  LoadConfigDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: LoadConfigFunction-dlq
+      MessageRetentionPeriod: 1209600
       KmsMasterKeyId: alias/aws/sqs
     UpdateReplacePolicy: Delete
     DeletionPolicy: Delete
@@ -540,6 +551,7 @@ Resources:
               - !GetAtt EOLDataQueryDLQ.Arn
               - !GetAtt EOLMcpAgentDLQ.Arn
               - !GetAtt LoadConfigDLQ.Arn
+              - !GetAtt RecalculateAccuracyScoresDLQ.Arn
     DeletionPolicy: Delete
 
   LambdaExecutionRole:
@@ -781,7 +793,7 @@ Resources:
       Runtime: python3.12
       Timeout: 300
       ReservedConcurrentExecutions: 5
-      CodeUri: ./src/EOLDataImportFunction.py
+      CodeUri: ./src/
       Handler: EOLDataImportFunction.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       DeadLetterQueue:
@@ -837,15 +849,6 @@ Resources:
         - python3.12
     DeletionPolicy: Delete
 
-  LoadConfigDLQ:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: LoadConfigFunction-dlq
-      MessageRetentionPeriod: 1209600
-      KmsMasterKeyId: alias/aws/sqs
-    UpdateReplacePolicy: Delete
-    DeletionPolicy: Delete
-
   LoadConfigFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -862,6 +865,41 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET_NAME: !Ref S3BucketName
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+    DeletionPolicy: Delete
+
+  RecalculateAccuracyScoresDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: RecalculateAccuracyScoresFunction-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  RecalculateAccuracyScoresFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: RecalculateAccuracyScoresFunction
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      CodeUri: ./src/
+      Handler: RecalculateAccuracyScoresFunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt RecalculateAccuracyScoresDLQ.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EOLTrackerDB
       KmsKeyArn: !GetAtt KMSKey.Arn
       VpcConfig:
         SecurityGroupIds:
@@ -912,14 +950,14 @@ Resources:
     UpdateReplacePolicy: Delete
     DeletionPolicy: Delete
 
-  # Step Functions State Machine with Map state for parallel processing
+  # Step Functions State Machine with nested Map states for multi-model processing
   EOLDataProcessingStateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
       StateMachineName: EOLDataProcessingStateMachine
       DefinitionString: !Sub |
         {
-          "Comment": "Process EOL data for multiple AWS services from config file",
+          "Comment": "Process EOL data for multiple models and AWS services from config file",
           "StartAt": "LoadServiceConfig",
           "States": {
             "LoadServiceConfig": {
@@ -928,85 +966,198 @@ Resources:
               "Parameters": {
                 "FunctionName": "${LoadConfigFunction}",
                 "Payload": {
-                  "configPath": "cfg/aws_services.json"
+                  "configPath": "cfg/EOLTracker_config.json"
                 }
               },
               "ResultPath": "$.configResult",
               "ResultSelector": {
+                "models.$": "$.Payload.models",
                 "services.$": "$.Payload.services"
               },
-              "Next": "ProcessEachService"
+              "Next": "ProcessEachModel"
             },
-            "ProcessEachService": {
+            "ProcessEachModel": {
               "Type": "Map",
-              "ItemsPath": "$.configResult.services",
+              "ItemsPath": "$.configResult.models",
               "MaxConcurrency": 1,
+              "Parameters": {
+                "model_id.$": "$$.Map.Item.Value",
+                "services.$": "$.configResult.services"
+              },
               "Iterator": {
-                "StartAt": "RunEOLMcpAgent",
+                "StartAt": "ProcessEachService",
                 "States": {
-                  "RunEOLMcpAgent": {
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::lambda:invoke",
+                  "ProcessEachService": {
+                    "Type": "Map",
+                    "ItemsPath": "$.services",
+                    "MaxConcurrency": 1,
                     "Parameters": {
-                      "FunctionName": "${EOLMcpAgentFunction}",
-                      "Payload.$": "$"
+                      "service_name.$": "$$.Map.Item.Value.service_name",
+                      "service_url.$": "$$.Map.Item.Value.service_url",
+                      "description.$": "$$.Map.Item.Value.description",
+                      "model_id.$": "$.model_id"
                     },
-                    "ResultPath": "$.mcpResult",
-                    "Next": "RunEOLDataImport",
-                    "Retry": [
-                      {
-                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
-                        "IntervalSeconds": 2,
-                        "MaxAttempts": 3,
-                        "BackoffRate": 2
-                      },
-                      {
-                        "ErrorEquals": ["States.TaskFailed"],
-                        "IntervalSeconds": 90,
-                        "MaxAttempts": 3,
-                        "BackoffRate": 2
-                      },
-                      {
-                        "ErrorEquals": ["States.ALL"],
-                        "IntervalSeconds": 10,
-                        "MaxAttempts": 2,
-                        "BackoffRate": 2
+                    "Iterator": {
+                      "StartAt": "RunEOLMcpAgent",
+                      "States": {
+                        "RunEOLMcpAgent": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::lambda:invoke",
+                          "Parameters": {
+                            "FunctionName": "${EOLMcpAgentFunction}",
+                            "Payload.$": "$"
+                          },
+                          "ResultPath": "$.mcpResult",
+                          "Next": "RunEOLDataImport",
+                          "Retry": [
+                            {
+                              "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                              "IntervalSeconds": 180,
+                              "MaxAttempts": 3,
+                              "BackoffRate": 2
+                            },
+                            {
+                              "ErrorEquals": ["States.TaskFailed"],
+                              "IntervalSeconds": 180,
+                              "MaxAttempts": 3,
+                              "BackoffRate": 2
+                            },
+                            {
+                              "ErrorEquals": ["States.ALL"],
+                              "IntervalSeconds": 180,
+                              "MaxAttempts": 2,
+                              "BackoffRate": 2
+                            }
+                          ],
+                          "Catch": [
+                            {
+                              "ErrorEquals": ["States.ALL"],
+                              "Next": "HandleMcpAgentFailure",
+                              "ResultPath": "$.error"
+                            }
+                          ]
+                        },
+                        "RunEOLDataImport": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::lambda:invoke",
+                          "Parameters": {
+                            "FunctionName": "${EOLDataImportFunction}",
+                            "Payload": {
+                              "service_name.$": "$.service_name",
+                              "model_id.$": "$.model_id",
+                              "results.$": "$.mcpResult.Payload.results"
+                            }
+                          },
+                          "ResultPath": "$.importResult",
+                          "Next": "CheckImportStatus",
+                          "Retry": [
+                            {
+                              "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                              "IntervalSeconds": 10,
+                              "MaxAttempts": 3,
+                              "BackoffRate": 2
+                            }
+                          ],
+                          "Catch": [
+                            {
+                              "ErrorEquals": ["States.ALL"],
+                              "Next": "HandleImportFailure",
+                              "ResultPath": "$.error"
+                            }
+                          ]
+                        },
+                        "CheckImportStatus": {
+                          "Type": "Choice",
+                          "Choices": [
+                            {
+                              "Variable": "$.importResult.Payload.statusCode",
+                              "NumericEquals": 200,
+                              "Next": "ImportSuccess"
+                            }
+                          ],
+                          "Default": "HandleImportFailure"
+                        },
+                        "ImportSuccess": {
+                          "Type": "Pass",
+                          "Parameters": {
+                            "service.$": "$.service_name",
+                            "model.$": "$.model_id",
+                            "status": "success",
+                            "timestamp.$": "$$.State.EnteredTime"
+                          },
+                          "End": true
+                        },
+                        "HandleImportFailure": {
+                          "Type": "Pass",
+                          "Parameters": {
+                            "service.$": "$.service_name",
+                            "model.$": "$.model_id",
+                            "error": "Data import failed",
+                            "errorDetails.$": "$.importResult.Payload.body",
+                            "timestamp.$": "$$.State.EnteredTime"
+                          },
+                          "End": true
+                        },
+                        "HandleMcpAgentFailure": {
+                          "Type": "Pass",
+                          "Parameters": {
+                            "service.$": "$.service_name",
+                            "model.$": "$.model_id",
+                            "error": "MCP Agent failed after all retry attempts",
+                            "errorDetails.$": "$.error",
+                            "timestamp.$": "$$.State.EnteredTime"
+                          },
+                          "End": true
+                        }
                       }
-                    ],
-                    "Catch": [
-                      {
-                        "ErrorEquals": ["States.ALL"],
-                        "Next": "HandleMcpAgentFailure",
-                        "ResultPath": "$.error"
-                      }
-                    ]
-                  },
-                  "RunEOLDataImport": {
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::lambda:invoke",
-                    "Parameters": {
-                      "FunctionName": "${EOLDataImportFunction}",
-                      "Payload.$": "States.StringToJson($.mcpResult.Payload.body)"
-                    },
-                    "End": true
-                  },
-                  "HandleMcpAgentFailure": {
-                    "Type": "Pass",
-                    "Parameters": {
-                      "service.$": "$.service_name",
-                      "error": "MCP Agent failed after all retry attempts",
-                      "errorDetails.$": "$.error",
-                      "timestamp.$": "$$.State.EnteredTime"
                     },
                     "End": true
                   }
                 }
               },
+              "Next": "RecalculateAccuracyScores"
+            },
+            "RecalculateAccuracyScores": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Comment": "Recalculate accuracy scores for all records with full consensus data",
+              "Parameters": {
+                "FunctionName": "${RecalculateAccuracyScoresFunction}",
+                "Payload": {
+                  "recalculate": true
+                }
+              },
+              "OutputPath": "$.Payload",
+              "Next": "ProcessingComplete",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleRecalculationFailure"
+                }
+              ]
+            },
+            "HandleRecalculationFailure": {
+              "Type": "Pass",
+              "Comment": "Log recalculation failure but don't fail the entire workflow",
+              "Parameters": {
+                "error": "Accuracy score recalculation failed",
+                "errorDetails.$": "$.error",
+                "timestamp.$": "$.State.EnteredTime",
+                "note": "Data processing completed but accuracy scores may not be fully updated"
+              },
               "Next": "ProcessingComplete"
             },
             "ProcessingComplete": {
               "Type": "Succeed",
-              "Comment": "EOL data processing completed successfully"
+              "Comment": "EOL data processing completed successfully for all models"
             }
           }
         }

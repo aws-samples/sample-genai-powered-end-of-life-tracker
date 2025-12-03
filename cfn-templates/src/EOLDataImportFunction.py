@@ -4,16 +4,21 @@ import logging
 import os
 from botocore.exceptions import ClientError
 
+# Import centralized error handling
+from ErrorHandler import handle_model_extraction_error, log_error_with_context
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-def get_data_from_s3(bucket_name, service_name):
+
+def get_data_from_s3(bucket_name, service_name, model_id=None):
     """
     Retrieve EOL data from S3 bucket
     
     Args:
         bucket_name: Name of the S3 bucket
         service_name: Name of the service (used for file naming)
+        model_id: Optional model identifier for multi-model support
         
     Returns:
         List of EOL data items or None if retrieval fails
@@ -41,8 +46,14 @@ def get_data_from_s3(bucket_name, service_name):
         s3_client = boto3.client('s3', config=config)
         logger.info("Successfully created S3 client to use private VPC Gateway endpoint")
         
-        # Create the file path
-        s3_file_key = f"eol_results/{service_name}.json"
+        # Create the file path with model subdirectory if model_id provided
+        if model_id:
+            # Sanitize model_id for use in S3 path (replace : and . with _)
+            safe_model = model_id.replace(':', '_').replace('.', '_')
+            s3_file_key = f"eol_results/{service_name}/{safe_model}.json"
+        else:
+            # Legacy path for backward compatibility
+            s3_file_key = f"eol_results/{service_name}.json"
         
         logger.info(f"In get_data_from_s3 attempting to retrieve object from S3: bucket={bucket_name}, key={s3_file_key}")
         
@@ -128,6 +139,12 @@ def lambda_handler(event, context):
         table_name = os.environ.get("TABLE_NAME", "EOLTrackerDB")
         table = dynamodb.Table(table_name)
 
+        # Extract model_id from event (for multi-model support)
+        model_id = event.get("model_id")
+        
+        # Get service_name from event for validation
+        service_name = event.get("service_name", event.get("service", "Unknown"))
+        
         # Get data from event or S3, no fallback to hardcoded data
         if "data" in event:
             eol_data = event["data"]
@@ -135,6 +152,36 @@ def lambda_handler(event, context):
         elif "results" in event:
             eol_data = event["results"]
             logger.info(f"Using results array from event with {len(eol_data)} items")
+            
+            # Validate and ensure required fields exist for event data
+            if not isinstance(eol_data, list):
+                error_msg = f"Results data is not a list: {type(eol_data)}"
+                logger.error(error_msg)
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"message": error_msg})
+                }
+            
+            # Ensure each item has required fields
+            for item in eol_data:
+                if not isinstance(item, dict):
+                    logger.warning(f"Skipping non-dict item: {item}")
+                    continue
+                
+                # Ensure service field exists (required for DynamoDB partition key)
+                if "service" not in item or not item["service"]:
+                    item["service"] = service_name
+                    logger.info(f"Added missing service field: {service_name}")
+                
+                # Set defaults for optional fields
+                item.setdefault("cycle", "Unknown")
+                item.setdefault("lts", None)
+                item.setdefault("releaseDate", None)
+                item.setdefault("supportEndDate", None)
+                item.setdefault("eol", None)
+                item.setdefault("latest", None)
+                item.setdefault("link", None)
+                item.setdefault("lastUpdated", None)
         else:
             # Try to get data from S3
             s3_bucket_name = os.environ.get("S3_BUCKET_NAME")
@@ -147,12 +194,19 @@ def lambda_handler(event, context):
                     "statusCode": 500,
                     "body": json.dumps({"message": error_msg})
                 }
-                
-            logger.info(f"In Lambda Handler: Attempting to retrieve data from S3 bucket {s3_bucket_name} for service {service_name}")
-            s3_data = get_data_from_s3(s3_bucket_name, service_name)
+            
+            # Include model context in logging
+            if model_id:
+                logger.info(f"In Lambda Handler: Attempting to retrieve data from S3 bucket {s3_bucket_name} for service {service_name} with model {model_id}")
+            else:
+                logger.info(f"In Lambda Handler: Attempting to retrieve data from S3 bucket {s3_bucket_name} for service {service_name}")
+            
+            s3_data = get_data_from_s3(s3_bucket_name, service_name, model_id)
             
             if not s3_data or len(s3_data) == 0:
                 error_msg = f"No valid data found in S3 bucket {s3_bucket_name} for service {service_name}"
+                if model_id:
+                    error_msg += f" with model {model_id}"
                 logger.error(error_msg)
                 return {
                     "statusCode": 404,
@@ -162,16 +216,33 @@ def lambda_handler(event, context):
             eol_data = s3_data
             logger.info(f"Successfully retrieved {len(eol_data)} items from S3")
 
-        # Import data into DynamoDB
+        # Import data into DynamoDB without accuracy scoring
+        # Accuracy scores will be calculated retroactively by RecalculateAccuracyScoresFunction
         imported_count = 0
         for item in eol_data:
-            # Add additional attributes if needed
+            # Add model_name attribute if model_id is provided
+            if model_id:
+                item['model_name'] = model_id
+                
+                # Create composite key cycle_model from cycle and model_name
+                cycle = item.get('cycle', 'Unknown')
+                item['cycle_model'] = f"{cycle}#{model_id}"
+                
+                # Log with model context
+                service = item.get('service', service_name)
+                logger.info(
+                    f"Importing record for service={service}, cycle={cycle}, model={model_id}"
+                )
+            
+            # Store item without accuracy_score - will be calculated retroactively
             table.put_item(Item=item)
             imported_count += 1
 
-        logger.info(
-            f"Imported {imported_count} records into DynamoDB table {table_name}"
-        )
+        # Include model context in success logging
+        if model_id:
+            logger.info(f"Imported {imported_count} records into DynamoDB table {table_name} for model {model_id}")
+        else:
+            logger.info(f"Imported {imported_count} records into DynamoDB table {table_name}")
 
         return {
             "statusCode": 200,
@@ -179,13 +250,35 @@ def lambda_handler(event, context):
                 {
                     "message": f"Imported {imported_count} records into DynamoDB",
                     "count": imported_count,
+                    "model_id": model_id
                 }
             ),
         }
 
     except Exception as e:
-        logger.error(f"Error importing data: {str(e)}")
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"message": f"Error importing data: {str(e)}"}),
-        }
+        # Use centralized error handling with model context
+        service_name = event.get("service_name", event.get("service", "Unknown"))
+        
+        if model_id:
+            # Use full error handling with S3 storage
+            error_context = handle_model_extraction_error(
+                error=e,
+                model_id=model_id,
+                service_name=service_name,
+                error_type="DataImportError"
+            )
+            error_msg = f"Error importing data for model {model_id}: {str(e)}"
+        else:
+            # Use simple logging for backward compatibility
+            log_error_with_context(
+                message=f"Error importing data: {str(e)}",
+                service_name=service_name
+            )
+            error_msg = f"Error importing data: {str(e)}"
+        
+        # Log the error details
+        logger.warning(error_msg)
+        
+        # Raise exception to trigger Step Function error handling
+        # This ensures the error is caught by the Catch block and properly handled
+        raise Exception(error_msg)
