@@ -112,7 +112,7 @@ def store_error_in_s3(
         logger.info(f"Stored error details in S3: s3://{s3_bucket_name}/{s3_error_key}")
         
     except ClientError as e:
-        logger.error(f"S3 error storage failed: {str(e)}")
+        logger.warning(f"S3 error storage failed: {str(e)}")
         raise
 
 

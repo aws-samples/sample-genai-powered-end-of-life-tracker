@@ -144,7 +144,7 @@ def lambda_handler(event, context):
         }
         
     except Exception as e:
-        logger.error(f"Error recalculating accuracy scores: {str(e)}")
+        logger.warning(f"Error recalculating accuracy scores: {str(e)}")
         
         # Raise exception to trigger Step Function error handling
         raise Exception(f"Error recalculating accuracy scores: {str(e)}")

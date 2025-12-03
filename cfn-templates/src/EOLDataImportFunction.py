@@ -277,7 +277,7 @@ def lambda_handler(event, context):
             error_msg = f"Error importing data: {str(e)}"
         
         # Log the error details
-        logger.error(error_msg)
+        logger.warning(error_msg)
         
         # Raise exception to trigger Step Function error handling
         # This ensures the error is caught by the Catch block and properly handled
