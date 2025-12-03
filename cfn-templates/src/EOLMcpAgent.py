@@ -16,6 +16,9 @@ from typing import List, Dict, Optional
 import jsonschema
 import socket
 
+# Import centralized error handling
+from ErrorHandler import handle_model_extraction_error, log_error_with_context
+
 # Increase socket timeout for VPC
 socket.setdefaulttimeout(600)
 
@@ -31,12 +34,8 @@ boto3_config = Config(
 os.environ['AWS_METADATA_SERVICE_TIMEOUT'] = '10'
 os.environ['AWS_METADATA_SERVICE_NUM_ATTEMPTS'] = '3'
 
-# Bedrock - disable streaming to avoid timeout issues in VPC
-bedrock_model = BedrockModel(
-  model_id="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-  temperature=0.1,
-  streaming=True
-)
+# Default Bedrock model - will be overridden per invocation
+DEFAULT_MODEL_ID = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
 
 # Configure logging (Lambda-friendly - no file handler)
 logger = logging.getLogger()
@@ -328,19 +327,24 @@ def load_service_config(config_file: str = "cfg/aws_services.json") -> List[Dict
         return []
 
 @tool
-def aws_eol_extractor(service_url: str, service_name: Optional[str] = None) -> str:
+def aws_eol_extractor(service_url: str, service_name: Optional[str] = None, model_id: Optional[str] = None) -> str:
     """Extract EOL information from AWS service documentation.
     
     Args:
         service_url: URL to the AWS service documentation page
         service_name: Optional name of the service for better logging
+        model_id: Optional Bedrock model identifier to use for extraction
         
     Returns:
         JSON formatted EOL information for the AWS service
     """
     
+    # Use default model if not provided
+    if not model_id:
+        model_id = DEFAULT_MODEL_ID
+    
     service_display = f"{service_name} ({service_url})" if service_name else service_url
-    logger.info(f"Starting EOL extraction for: {service_display}")
+    logger.info(f"Starting EOL extraction for: {service_display} using model: {model_id}")
     
     try:
         logger.info("Initializing MCP client for AWS documentation server...")
@@ -432,6 +436,32 @@ def aws_eol_extractor(service_url: str, service_name: Optional[str] = None) -> s
             # Get current timestamp for lastUpdated field
             current_timestamp = datetime.now().strftime("%Y-%m-%d")
             
+            # Initialize Bedrock model with specified model_id
+            try:
+                logger.info(f"Initializing BedrockModel with model_id: {model_id}")
+                bedrock_model = BedrockModel(
+                    model_id=model_id,
+                    temperature=0.1,
+                    streaming=True
+                )
+                logger.info(f"Initialized BedrockModel with model_id: {model_id}")
+            except Exception as model_error:
+                # Use centralized error handling with model context
+                error_context = handle_model_extraction_error(
+                    error=model_error,
+                    model_id=model_id,
+                    service_name=service_name or "Unknown",
+                    error_type="ModelInitializationError",
+                    additional_context={"service_url": service_url}
+                )
+                error_response = {
+                    "error": f"Model {model_id} is not available or initialization failed",
+                    "model_id": model_id,
+                    "service_url": service_url,
+                    "extraction_date": datetime.now().strftime("%Y-%m-%d")
+                }
+                return json.dumps(error_response, indent=2)
+            
             # Create the EOL extraction agent
             eol_agent = Agent(
                 model=bedrock_model,
@@ -511,7 +541,14 @@ Focus only on factual EOL information from official AWS documentation.""",
                 return cleaned_response
             
     except Exception as e:
-        logger.error(f"Error during EOL extraction: {str(e)}", exc_info=True)
+        # Use centralized error handling with model context
+        error_context = handle_model_extraction_error(
+            error=e,
+            model_id=model_id,
+            service_name=service_name or "Unknown",
+            error_type="ExtractionError",
+            additional_context={"service_url": service_url}
+        )
         error_response = {
             "error": f"Failed to extract EOL information: {str(e)}",
             "service_url": service_url,
@@ -519,12 +556,13 @@ Focus only on factual EOL information from official AWS documentation.""",
         }
         return json.dumps(error_response, indent=2)
 
-def save_to_s3(data: list, service_name: str = None) -> None:
+def save_to_s3(data: list, service_name: str = None, model_id: str = None) -> None:
     """Save EOL data to S3 bucket.
     
     Args:
         data: List of validated EOL records to save
         service_name: Optional service name for individual file, if None saves as aggregated file
+        model_id: Optional model identifier to include in S3 path
     """
     s3_bucket_name = os.environ.get('S3_BUCKET_NAME')
     
@@ -536,8 +574,13 @@ def save_to_s3(data: list, service_name: str = None) -> None:
         config = Config(connect_timeout=120, read_timeout=300)
         s3_client = boto3.client('s3', config=config)
         
-        if service_name:
-            # Individual service file
+        if service_name and model_id:
+            # Individual service file with model subdirectory
+            safe_service_name = service_name.replace(' ', '_').lower()
+            safe_model_id = model_id.replace(':', '_').replace('.', '_')
+            s3_file_key = f"eol_results/{safe_service_name}/{safe_model_id}.json"
+        elif service_name:
+            # Individual service file (backward compatibility)
             safe_service_name = service_name.replace(' ', '_').lower()
             s3_file_key = f"eol_results/{safe_service_name}.json"
         else:
@@ -570,27 +613,29 @@ def process_single_service(service_config: Dict) -> Dict:
     """Process a single AWS service for EOL information.
     
     Args:
-        service_config: Dictionary containing service_name, service_url, and description
+        service_config: Dictionary containing service_name, service_url, description, and optional model_id
         
     Returns:
         Dictionary containing results for the single service
     """
     service_name = service_config.get('service_name', 'Unknown Service')
     service_url = service_config.get('service_url', '')
+    model_id = service_config.get('model_id', DEFAULT_MODEL_ID)
     
-    logger.info(f"=== Processing single service: {service_name} ===")
+    logger.info(f"=== Processing single service: {service_name} with model: {model_id} ===")
     
     if not service_url:
         logger.error(f"No URL provided for service '{service_name}'")
         return {
             'service': service_name,
+            'model_id': model_id,
             'error': 'No service URL provided',
             'extraction_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     
     try:
-        # Extract EOL information
-        result = aws_eol_extractor(service_url, service_name)
+        # Extract EOL information with specified model
+        result = aws_eol_extractor(service_url, service_name, model_id)
         result_data = json.loads(result)
         logger.info(f"Extracted data: {result_data}")
         
@@ -634,20 +679,28 @@ def process_single_service(service_config: Dict) -> Dict:
         
         logger.info(f"✓ Successfully processed {service_name}")
         
-        # Save to S3 with service-specific filename
-        save_to_s3(validated_results, service_name)
+        # Save to S3 with service-specific filename and model subdirectory
+        save_to_s3(validated_results, service_name, model_id)
         
         return {
             'service': service_name,
             'service_name': service_name,
+            'model_id': model_id,
             'extraction_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'results': validated_results
         }
         
     except Exception as e:
-        logger.error(f"✗ Failed to process {service_name}: {str(e)}")
+        # Use centralized error handling with model context
+        error_context = handle_model_extraction_error(
+            error=e,
+            model_id=model_id,
+            service_name=service_name,
+            error_type="ServiceProcessingError"
+        )
         return {
             'service': service_name,
+            'model_id': model_id,
             'error': str(e),
             'extraction_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
@@ -791,14 +844,21 @@ def lambda_handler(event, context):
             # Raise exception if processing failed to trigger Step Function retry
             if 'error' in result:
                 error_msg = f"Failed to process service {event.get('service_name', 'Unknown')}: {result['error']}"
-                logger.warning(error_msg)
+                
+                # Log with model context using centralized error handler
+                model_id = event.get('model_id', DEFAULT_MODEL_ID)
+                service_name = event.get('service_name', 'Unknown')
+                log_error_with_context(
+                    message=error_msg,
+                    model_id=model_id,
+                    service_name=service_name
+                )
+                
                 raise Exception(error_msg)
             
-            return {
-                'statusCode': 200,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps(result)
-            }
+            # Return result directly for Step Functions integration
+            # Step Functions expects the raw result, not wrapped in API Gateway format
+            return result
         else:
             # No service in event, run batch processing of all services
             logger.info("Starting batch processing of all configured services")
@@ -811,6 +871,15 @@ def lambda_handler(event, context):
             }
             
     except Exception as e:
-        logger.warning(f"Lambda execution failed: {str(e)}", exc_info=True)
+        # Use centralized error logging with model context if available
+        model_id = event.get('model_id', DEFAULT_MODEL_ID) if isinstance(event, dict) else DEFAULT_MODEL_ID
+        service_name = event.get('service_name', 'Unknown') if isinstance(event, dict) else 'Unknown'
+        
+        log_error_with_context(
+            message=f"Lambda execution failed: {str(e)}",
+            model_id=model_id,
+            service_name=service_name
+        )
+        
         # Re-raise the exception to trigger Step Function retry mechanism
         raise e
